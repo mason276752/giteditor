@@ -1,0 +1,28 @@
+{
+  "name": "giteditor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "homepage": "https://mason276752.github.io/giteditor/",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "type-check": "vue-tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "bcrypt-pbkdf": "^1.0.2",
+    "fflate": "^0.8.3",
+    "openpgp": "^6.3.2",
+    "vue": "^3.5.45"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "typescript": "~5.7",
+    "vite": "^6.4.6",
+    "vitest": "^3.2.7",
+    "vue-tsc": "^2.2.12"
+  }
+}
