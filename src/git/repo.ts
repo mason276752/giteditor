@@ -102,6 +102,54 @@ class Pack {
     return new Pack(repo, name, blob, hashes, offsets, fanout)
   }
 
+  // Hashes starting with `prefix` (2 or more hex digits).
+  matching(prefix: string): string[] {
+    const n = this.repo.hashLen
+    const first = parseInt(prefix.slice(0, 2), 16)
+    const out: string[] = []
+    for (let i = first ? this.fanout[first - 1] : 0; i < this.fanout[first]; i++) {
+      const h = hex(this.hashes.subarray(i * n, i * n + n))
+      if (h.startsWith(prefix)) out.push(h)
+    }
+    return out
+  }
+
+  // The commits in the pack. Only object headers are read (a delta has its base's type).
+  async commits(): Promise<string[]> {
+    const n = this.repo.hashLen
+    const out: string[] = []
+    for (let i = 0; i < this.count; i++) {
+      if ((await this.typeAt(this.offsets[i])) === 'commit') out.push(hex(this.hashes.subarray(i * n, i * n + n)))
+    }
+    return out
+  }
+
+  private types = new Map<number, ObjType>()
+  async typeAt(offset: number): Promise<ObjType> {
+    let t = this.types.get(offset)
+    if (t) return t
+    const buf = await this.bytes(offset, Math.min(offset + 32 + this.repo.hashLen, this.endOf(offset)))
+    let i = 0
+    let c = buf[i++]
+    const code = (c >> 4) & 7
+    while (c & 0x80) c = buf[i++]
+    if (code === 6) {
+      c = buf[i++]
+      let back = c & 0x7f
+      while (c & 0x80) {
+        c = buf[i++]
+        back = (back + 1) * 128 + (c & 0x7f)
+      }
+      t = await this.typeAt(offset - back)
+    } else if (code === 7) {
+      t = await this.repo.typeOf(hex(buf.subarray(i, i + this.repo.hashLen)))
+    } else {
+      t = PACK_TYPES[code]
+    }
+    this.types.set(offset, t)
+    return t
+  }
+
   find(hash: Uint8Array): number {
     const n = this.repo.hashLen
     let lo = hash[0] ? this.fanout[hash[0] - 1] : 0
@@ -347,6 +395,38 @@ export class Repo {
     if (this.commits.has(hash)) return 'commit'
     if (this.tags.has(hash)) return 'tag'
     return (await this.read(hash)).type
+  }
+
+  // Every object whose hash starts with `prefix`, wherever it is.
+  async findPrefix(prefix: string): Promise<string[]> {
+    const out = new Set<string>()
+    for (const h of this.mem.keys()) if (h.startsWith(prefix)) out.add(h)
+    for (const p of this.packs) for (const h of p.matching(prefix)) out.add(h)
+    for (const e of (await this.fs.list(`objects/${prefix.slice(0, 2)}`)) ?? []) {
+      const h = prefix.slice(0, 2) + e.name
+      if (!e.dir && h.startsWith(prefix) && h.length === this.hashLen * 2) out.add(h)
+    }
+    return [...out]
+  }
+
+  // Every commit in the repository, reachable or not: packed, loose, and made here.
+  async allCommits(): Promise<string[]> {
+    const out = new Set<string>()
+    for (const p of this.packs) for (const h of await p.commits()) out.add(h)
+    const dirs = ((await this.fs.list('objects')) ?? []).filter((e) => e.dir && /^[0-9a-f]{2}$/.test(e.name))
+    for (const d of dirs) {
+      for (const e of (await this.fs.list(`objects/${d.name}`)) ?? []) {
+        const h = d.name + e.name
+        if (e.dir || h.length !== this.hashLen * 2 || out.has(h)) continue
+        try {
+          if ((await this.read(h)).type === 'commit') out.add(h)
+        } catch {
+          // A broken loose object; fsck's business, not ours.
+        }
+      }
+    }
+    for (const [h, o] of this.mem) if (o.type === 'commit') out.add(h)
+    return [...out]
   }
 
   // Follows annotated tags down to what they finally point at.

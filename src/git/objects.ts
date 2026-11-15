@@ -47,7 +47,8 @@ export interface Tag {
 
 export interface TreeEntry {
   mode: string
-  name: string
+  name: string // for showing
+  raw: string // as stored (binary string), for rebuilding the tree
   hash: string
 }
 
@@ -155,6 +156,7 @@ export function parseTree(data: Uint8Array, hashLen: number): TreeEntry[] {
     out.push({
       mode: toBin(data.subarray(i, sp)),
       name: decoder().decode(data.subarray(sp + 1, nul)),
+      raw: toBin(data.subarray(sp + 1, nul)),
       hash: hex(data.subarray(nul + 1, nul + 1 + hashLen)),
     })
     i = nul + 1 + hashLen
@@ -164,6 +166,7 @@ export function parseTree(data: Uint8Array, hashLen: number): TreeEntry[] {
 
 // ---------- rewriting ----------
 export interface CommitEdit {
+  tree?: string
   author?: Person
   committer?: Person
   message?: string
@@ -186,7 +189,9 @@ export function commitPayload(c: Commit, parents: string[], edit: CommitEdit = {
   let placedParents = false
   for (const h of c.headers) {
     if (h.key === 'parent' || SIG_HEADERS.includes(h.key) || (reencode && h.key === 'encoding')) continue
-    if (h.key === 'author' && (edit.author || reencode)) {
+    if (h.key === 'tree' && edit.tree) {
+      headers.push({ key: 'tree', value: edit.tree })
+    } else if (h.key === 'author' && (edit.author || reencode)) {
       headers.push({ key: 'author', value: textToBin(formatPerson(edit.author ?? c.author)) })
     } else if (h.key === 'committer' && (edit.committer || reencode)) {
       headers.push({ key: 'committer', value: textToBin(formatPerson(edit.committer ?? c.committer)) })

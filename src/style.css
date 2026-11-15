@@ -122,6 +122,14 @@ h1 { margin: 0; font-size: 21px; letter-spacing: -.01em; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 10px; }
 .toolbar .group { display: flex; flex-wrap: wrap; gap: 6px; }
 .toolbar .end { margin-left: auto; }
+.btn.on { border-color: var(--accent); color: var(--accent); }
+.checkout { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--muted); }
+.checkout select { max-width: 16em; font-weight: 600; color: var(--text); }
+/* Room for the terminal drawer at the bottom: the list and the pane end above it. */
+.app.with-term { --term: min(44vh, 460px); padding-bottom: calc(var(--term) + 24px); }
+.app.with-term .work > .pane { max-height: calc(100vh - var(--term) - 24px); }
+.app.with-term .work .graph { max-height: max(240px, calc(100vh - var(--term) - 170px)); }
+@media (max-width: 600px) { .app.with-term { --term: 52vh; } }
 .tabs { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 11px; background: var(--bg); }
 .tab {
   display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 4px 12px;
@@ -161,6 +169,7 @@ h1 { margin: 0; font-size: 21px; letter-spacing: -.01em; }
 .chip-branch { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }
 .chip-tag { border-color: color-mix(in srgb, var(--folder) 55%, var(--line)); color: var(--folder); }
 .chip-remote { color: var(--muted); }
+.chip-dangling { border-style: dashed; color: var(--warn); }
 .code {
   margin: 0; padding: 12px 14px; overflow: auto; max-height: 60vh;
   border: 1px solid var(--line); border-radius: 10px; background: var(--bg);

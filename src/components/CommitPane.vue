@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, reactive, ref, shallowRef, watch } from 'vue'
-import { decoder } from '../git/bytes'
+import { binToText, decoder } from '../git/bytes'
+import { isBinary } from '../git/diff'
 import { readError } from '../git/fs'
-import { shortRef, type History, type RefState } from '../git/history'
+import { fileToText } from '../git/shell'
+import { shortRef, type History } from '../git/history'
 import { parseTree, type CommitEdit, type Person, type SigKind } from '../git/objects'
 import type { Repo } from '../git/repo'
 import { affected, movable, type DescendantSigs, type RewriteRequest } from '../git/rewrite'
@@ -15,10 +17,11 @@ import TreeNode, { type TNode } from './TreeNode.vue'
 const props = defineProps<{
   repo: Repo
   history: History
-  state: RefState
   hash: string
   origin: string | null // the commit's hash before it was rewritten here
   busy: boolean
+  locked: string // why editing isn't possible right now (a rebase in the terminal), or ''
+  editText: (title: string, text: string) => Promise<string | null>
 }>()
 const signer = defineModel<Signer | null>('signer', { required: true })
 const emit = defineEmits<{
@@ -27,6 +30,8 @@ const emit = defineEmits<{
   apply: [req: RewriteRequest]
   openFile: [path: string, hash: string]
   toast: [msg: string]
+  checkout: [hash: string]
+  branch: [hash: string]
 }>()
 
 const commit = computed(() => props.history.commits.get(props.hash)!)
@@ -48,7 +53,37 @@ const form = reactive({
 const samePerson = (a: Person, b: Person) => a.name === b.name && a.email === b.email && a.time === b.time && a.tz === b.tz
 const shownMessage = (m: string) => m.replace(/\n$/, '')
 
+// Files changed here (raw path → new content), applied with the rest of the form.
+const fileEdits = shallowRef(new Map<string, Uint8Array>())
+const editedPaths = computed(() => new Set(fileEdits.value.keys()))
+
+async function editFile(node: TNode, rawPath: string, path: string) {
+  try {
+    const current = fileEdits.value.get(rawPath) ?? (await props.repo.read(node.id)).data
+    if (isBinary(current)) return emit('toast', `${path} 是二進位檔案，這裡只能改文字檔`)
+    if (current.length > 2 << 20) return emit('toast', `${path} 超過 2 MB，這裡的編輯器打不開`)
+    const f = fileToText(current)
+    const text = await props.editText(`${path}（${commit.value.hash.slice(0, 7)}）`, f.text)
+    if (text === null || text === f.text) return
+    const next = new Map(fileEdits.value)
+    const original = (await props.repo.read(node.id)).data
+    const data = f.save(text)
+    if (data.length === original.length && data.every((b, i) => b === original[i])) next.delete(rawPath)
+    else next.set(rawPath, data)
+    fileEdits.value = next
+  } catch (e) {
+    emit('toast', readError(e))
+  }
+}
+
+function revertFile(rawPath: string) {
+  const next = new Map(fileEdits.value)
+  next.delete(rawPath)
+  fileEdits.value = next
+}
+
 function reset() {
+  fileEdits.value = new Map()
   const c = commit.value
   Object.assign(form, {
     message: shownMessage(c.message),
@@ -99,12 +134,12 @@ const edit = computed<CommitEdit>(() => {
   if (form.message !== shownMessage(c.message)) e.message = form.message
   return e
 })
-const edited = computed(() => Object.keys(edit.value).length > 0)
+const edited = computed(() => Object.keys(edit.value).length > 0 || fileEdits.value.size > 0)
 const formDirty = computed(() => edited.value || form.same !== samePerson(commit.value.author, commit.value.committer) || form.sig !== (commit.value.sig ? 'keep' : 'none'))
 
 // ---------- what else gets rewritten ----------
-const affectedWithTags = computed(() => affected(props.history, props.state, props.hash, true))
-const affectedList = computed(() => (form.moveTags ? affectedWithTags.value : affected(props.history, props.state, props.hash, false)))
+const affectedWithTags = computed(() => affected(props.history, props.hash, true))
+const affectedList = computed(() => (form.moveTags ? affectedWithTags.value : affected(props.history, props.hash, false)))
 const reachable = computed(() => affectedList.value.length > 0)
 const descendants = computed(() => affectedList.value.slice(1))
 const signedDescendants = computed(() => descendants.value.filter((h) => props.history.commits.get(h)!.sig).length)
@@ -124,10 +159,10 @@ const willSign = computed(() => form.sig === 'sign')
 const needsKey = computed(() => willSign.value || (form.descendants !== 'drop' && descendants.value.length > 0))
 const changes = computed(() => edited.value || willSign.value || (form.sig === 'none' && !!commit.value.sig))
 const canApply = computed(
-  () => reachable.value && !problems.value.length && !props.busy && changes.value && (!needsKey.value || !!signer.value),
+  () => reachable.value && !props.locked && !problems.value.length && !props.busy && changes.value && (!needsKey.value || !!signer.value),
 )
 const blocker = computed(() => {
-  if (!reachable.value || props.busy) return ''
+  if (!reachable.value || props.busy || props.locked) return ''
   if (problems.value.length) return ''
   if (!changes.value) return '改一下欄位，或選擇簽名，就能套用。'
   if (needsKey.value && !signer.value) return '要簽名，請先在上面載入私鑰。'
@@ -143,6 +178,7 @@ function apply() {
     descendants: descendants.value.length ? form.descendants : 'drop',
     signer: signer.value,
     moveTags: form.moveTags,
+    files: fileEdits.value.size ? fileEdits.value : undefined,
   })
 }
 
@@ -162,6 +198,7 @@ async function loadTree(node: TNode): Promise<TNode[]> {
   return parseTree(o.data, props.repo.hashLen)
     .map((e) => ({
       name: e.name,
+      raw: e.raw,
       id: e.hash,
       dir: e.mode === '40000',
       note: e.mode === '160000' ? 'submodule' : e.mode === '120000' ? '連結' : undefined,
@@ -206,22 +243,31 @@ const TZS = ['+0000', '+0100', '+0200', '+0300', '+0400', '+0530', '+0700', '+08
       <b>commit</b>
       <code class="clip grow" :title="hash">{{ hash.slice(0, 12) }}</code>
       <button type="button" class="btn icon small" title="複製完整 hash" @click="copyHash"><Icon name="copy" /></button>
+      <button type="button" class="btn small" title="在這個頁面裡 checkout 這個 commit（不會動到 repo 的 HEAD）" @click="emit('checkout', hash)">
+        <Icon name="branch" />切換到這裡
+      </button>
+      <button type="button" class="btn icon small" title="在這個 commit 建立新分支" @click="emit('branch', hash)"><Icon name="plus" /></button>
       <button type="button" class="btn icon small" title="關閉（Esc）" @click="emit('close')"><Icon name="x" /></button>
     </header>
 
     <div class="pane-body">
       <div v-if="labels.length" class="pane-refs">
         <span v-for="l in labels" :key="l.name" class="chip" :class="`chip-${l.kind}`">
-          <Icon :name="l.kind === 'tag' ? 'tag' : 'branch'" />{{ l.short }}{{ l.current ? '（目前）' : '' }}
+          <Icon :name="l.kind === 'tag' ? 'tag' : l.kind === 'dangling' ? 'alert' : l.kind === 'head' ? 'commit' : 'branch'" />{{ l.short }}{{ l.current ? '（目前）' : '' }}
         </span>
       </div>
       <p v-if="origin" class="note changed-note">改寫過、還沒寫入。原本是 <code>{{ origin.slice(0, 10) }}</code>。</p>
       <p v-if="!reachable" class="note warn-note">
         <Icon name="alert" />
-        沒有本地分支包含這個 commit（只在遠端分支{{ form.moveTags ? '' : '或標籤' }}上），改了也不會有分支指向它，所以不能改。
+        <span>
+          沒有本地分支{{ form.moveTags ? '' : '或標籤' }}包含這個 commit，改了也不會有分支指向它，所以不能在這裡改。
+          要改它，先按 <Icon name="plus" class="inline" /> 在這裡建一個分支（或按「切換到這裡」再到終端機 git switch -c 新分支）。
+        </span>
       </p>
 
-      <fieldset class="form" :disabled="!reachable || busy">
+      <p v-if="locked" class="note warn-note"><Icon name="alert" />{{ locked }}</p>
+
+      <fieldset class="form" :disabled="!reachable || busy || !!locked">
         <label class="field">
           <span class="label">訊息</span>
           <textarea v-model="form.message" rows="5" spellcheck="false"></textarea>
@@ -287,6 +333,17 @@ const TZS = ['+0000', '+0100', '+0200', '+0300', '+0400', '+0530', '+0700', '+08
           </select>
         </div>
 
+        <div v-if="fileEdits.size" class="group">
+          <span class="label">修改的檔案</span>
+          <ul class="edited">
+            <li v-for="[path] in fileEdits" :key="path">
+              <code>{{ binToText(path) }}</code>
+              <button type="button" class="btn small" @click="revertFile(path)">還原</button>
+            </li>
+          </ul>
+          <p class="hint">{{ descendants.length ? `後面的 ${descendants.length} 個 commit 也會帶入同樣的修改（像 rebase 那樣合併）；有 commit 改到同一段的話會取消，什麼都不改。` : '' }}</p>
+        </div>
+
         <div v-if="needsKey || signer" class="group">
           <span class="label">私鑰</span>
           <KeyPanel v-model="signer" />
@@ -335,10 +392,12 @@ const TZS = ['+0000', '+0100', '+0200', '+0300', '+0400', '+0530', '+0700', '+08
 
       <details class="block" open>
         <summary>檔案</summary>
+        <p class="hint">點檔名看內容；按 <Icon name="pencil" class="inline" /> 修改這個 commit 裡的檔案，改好再按「套用修改」。</p>
         <p v-if="treeError" class="error">{{ treeError }}</p>
         <ul class="tree">
-          <TreeNode v-for="n in treeRoots" :key="n.name" :node="n" :path="n.name" :depth="0" :load="loadTree" :active="null"
-                    @open="(node, path) => emit('openFile', path, node.id)" />
+          <TreeNode v-for="n in treeRoots" :key="n.name" :node="n" :path="n.name" :raw-path="n.raw" :depth="0" :load="loadTree"
+                    :active="null" :editable="reachable && !locked" :edited="editedPaths"
+                    @open="(node, path) => emit('openFile', path, node.id)" @edit="editFile" />
         </ul>
       </details>
       <details class="block" @toggle="onRawToggle">
@@ -370,6 +429,10 @@ const TZS = ['+0000', '+0100', '+0200', '+0300', '+0400', '+0530', '+0700', '+08
 .tz { width: 6.6em; font-variant-numeric: tabular-nums; }
 textarea { width: 100%; resize: vertical; min-height: 6em; }
 .hint { margin: 0; color: var(--muted); font-size: 12.5px; }
+.edited { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.edited li { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.edited code { color: var(--warn); overflow-wrap: anywhere; }
+.inline { width: 13px; height: 13px; vertical-align: -2px; }
 .problems { margin: 0; padding-left: 1.2em; color: var(--danger); font-size: 13px; }
 .apply-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 2px; }
 .info { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; margin: 20px 0 6px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 13.5px; }

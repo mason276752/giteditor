@@ -7,13 +7,13 @@ export interface RefState {
   head: Head
 }
 
-export type RefKind = 'head' | 'branch' | 'remote' | 'tag'
+export type RefKind = 'head' | 'branch' | 'remote' | 'tag' | 'dangling'
 
 export interface RefLabel {
-  name: string // full ref name ('HEAD' for a detached HEAD)
+  name: string // full ref name; HEAD (the page's, when detached), REPO_HEAD (the repo's, detached), DANGLING
   short: string
   kind: RefKind
-  current?: boolean // the branch HEAD is on
+  current?: boolean // the branch the page has checked out
 }
 
 // One line of the graph. `lines` is flat: x1, y1, x2, y2, colour per segment, with x in lanes and
@@ -31,7 +31,7 @@ export interface History {
   index: Map<string, number> // commit → row
   children: Map<string, string[]>
   labels: Map<string, RefLabel[]> // commit → refs pointing at it
-  peeled: Map<string, string> // ref → the commit it ends up at
+  peeled: Map<string, string> // ref (or HEAD, REPO_HEAD) → the commit it ends up at
   lanes: number
   missing: number // parents that aren't in the repo (shallow clone)
 }
@@ -39,7 +39,7 @@ export interface History {
 const COLORS = 8
 
 export function refKind(name: string): RefKind | null {
-  if (name === 'HEAD') return 'head'
+  if (name === 'HEAD' || name === 'REPO_HEAD') return 'head'
   if (name.startsWith('refs/heads/')) return 'branch'
   if (name.startsWith('refs/remotes/')) return 'remote'
   if (name.startsWith('refs/tags/')) return 'tag'
@@ -48,36 +48,46 @@ export function refKind(name: string): RefKind | null {
 
 export const shortRef = (name: string) => name.replace(/^refs\/(heads|remotes|tags)\//, '')
 
+interface LoadOptions {
+  remotes?: boolean
+  checkout?: Head // the page's HEAD (defaults to the repo's)
+  dangling?: string[] // unreachable commits to show too
+  onProgress?: (n: number) => void
+}
+
+const LABEL_NAMES: Record<string, string> = { HEAD: 'HEAD', REPO_HEAD: 'repo 的 HEAD', DANGLING: 'dangling' }
+
 export async function loadHistory(
   repo: Repo,
   state: RefState,
-  { remotes = true, onProgress }: { remotes?: boolean; onProgress?: (n: number) => void } = {},
+  { remotes = true, checkout = state.head, dangling = [], onProgress }: LoadOptions = {},
 ): Promise<History> {
   // Branches, remote branches, tags and HEAD, like `git log --all` without stash or notes.
-  const shown = [...state.refs].filter(([name]) => refKind(name) && (remotes || refKind(name) !== 'remote'))
-  if (!state.head.ref && state.head.hash) shown.push(['HEAD', state.head.hash])
+  const shown: [string, string][] = [...state.refs].filter(([name]) => refKind(name) && (remotes || refKind(name) !== 'remote'))
+  if (!checkout.ref && checkout.hash) shown.push(['HEAD', checkout.hash])
+  if (!state.head.ref && state.head.hash && state.head.hash !== checkout.hash) shown.push(['REPO_HEAD', state.head.hash])
   const peeled = new Map<string, string>()
   const labels = new Map<string, RefLabel[]>()
+  const label = (hash: string, l: RefLabel) => labels.set(hash, [...(labels.get(hash) ?? []), l])
+  for (const h of dangling) label(h, { name: 'DANGLING', short: LABEL_NAMES.DANGLING, kind: 'dangling' })
   await Promise.all(
     shown.map(async ([name, hash]) => {
       try {
         const p = await repo.peel(hash)
         if (p.type !== 'commit') return
         peeled.set(name, p.hash)
-        const kind = refKind(name)!
-        const label: RefLabel = { name, short: kind === 'head' ? 'HEAD' : shortRef(name), kind, current: name === state.head.ref }
-        labels.set(p.hash, [...(labels.get(p.hash) ?? []), label])
+        label(p.hash, { name, short: LABEL_NAMES[name] ?? shortRef(name), kind: refKind(name)!, current: name === checkout.ref })
       } catch (e) {
         if (!(e instanceof MissingObjectError)) throw e
       }
     }),
   )
-  const order: RefKind[] = ['head', 'branch', 'tag', 'remote']
+  const order: RefKind[] = ['head', 'branch', 'tag', 'remote', 'dangling']
   for (const l of labels.values()) l.sort((a, b) => +!!b.current - +!!a.current || order.indexOf(a.kind) - order.indexOf(b.kind))
 
   // Every commit reachable from them.
   const commits = new Map<string, Commit>()
-  const seen = new Set(peeled.values())
+  const seen = new Set([...peeled.values(), ...dangling])
   let queue = [...seen]
   let missing = 0
   while (queue.length) {

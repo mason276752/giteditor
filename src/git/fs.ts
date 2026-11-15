@@ -4,6 +4,7 @@ export interface GitFs {
   list(path: string): Promise<DirEntry[] | null>
   // Only sources that can write back (a directory handle in Chromium) have these.
   write?(path: string, data: Uint8Array, append?: boolean): Promise<void>
+  remove?(path: string): Promise<void>
   // Asks for permission to write; must be called from a click.
   requestWrite?(): Promise<boolean>
 }
@@ -65,6 +66,14 @@ export function handleFs(root: FileSystemDirectoryHandle): GitFs {
       if (append) await w.seek((await fh.getFile()).size)
       await w.write(data as Uint8Array<ArrayBuffer>)
       await w.close()
+    },
+    async remove(path) {
+      const segs = parts(path)
+      try {
+        await (await dir(segs.slice(0, -1))).removeEntry(segs.at(-1)!)
+      } catch (e) {
+        if ((e as DOMException).name !== 'NotFoundError') throw e
+      }
     },
     async requestWrite() {
       const h = root as unknown as PermissionHandle
@@ -128,6 +137,7 @@ export function subFs(fs: GitFs, prefix: string): GitFs {
     file: (path) => fs.file(p(path)),
     list: (path) => fs.list(p(path)),
     write: fs.write && ((path, data, append) => fs.write!(p(path), data, append)),
+    remove: fs.remove && ((path) => fs.remove!(p(path))),
     requestWrite: fs.requestWrite,
   }
 }

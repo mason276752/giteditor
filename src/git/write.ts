@@ -1,14 +1,15 @@
 import { zlibSync } from 'fflate'
-import { concat, digest, enc, type HashAlgo } from './bytes'
+import { binToText, concat, digest, enc, type HashAlgo } from './bytes'
 import type { RefState } from './history'
 import { shortRef } from './history'
-import type { ObjType } from './objects'
+import { parseTree, type ObjType } from './objects'
 import { PACK_CODES, type Repo } from './repo'
+import { diffTrees } from './tree'
 
 export interface RefUpdate {
   name: string // 'HEAD' when HEAD is detached
-  old: string | null
-  new: string
+  old: string | null // null: a new ref
+  new: string | null // null: deleted
 }
 
 export function refUpdates(base: RefState, cur: RefState): RefUpdate[] {
@@ -17,6 +18,7 @@ export function refUpdates(base: RefState, cur: RefState): RefUpdate[] {
     const old = base.refs.get(name) ?? null
     if (old !== hash) out.push({ name, old, new: hash })
   }
+  for (const [name, old] of base.refs) if (!cur.refs.has(name)) out.push({ name, old, new: null })
   if (!cur.head.ref && cur.head.hash && cur.head.hash !== base.head.hash) {
     out.push({ name: 'HEAD', old: base.head.hash, new: cur.head.hash })
   }
@@ -33,7 +35,7 @@ interface NewObject {
 export async function newObjects(repo: Repo, updates: RefUpdate[]): Promise<NewObject[]> {
   const out: NewObject[] = []
   const seen = new Set<string>()
-  const stack = updates.map((u) => u.new)
+  const stack = updates.flatMap((u) => (u.new ? [u.new] : []))
   while (stack.length) {
     const hash = stack.pop()!
     if (seen.has(hash)) continue
@@ -41,8 +43,14 @@ export async function newObjects(repo: Repo, updates: RefUpdate[]): Promise<NewO
     const o = repo.mem.get(hash)
     if (!o) continue
     out.push({ hash, ...o })
-    if (o.type === 'commit') stack.push(...(await repo.commit(hash)).parents)
-    else if (o.type === 'tag') stack.push((await repo.tag(hash)).object)
+    if (o.type === 'commit') {
+      const c = await repo.commit(hash)
+      stack.push(...c.parents, c.tree)
+    } else if (o.type === 'tag') {
+      stack.push((await repo.tag(hash)).object)
+    } else if (o.type === 'tree') {
+      for (const e of parseTree(o.data, repo.hashLen)) if (e.mode !== '160000') stack.push(e.hash)
+    }
   }
   return out
 }
@@ -87,15 +95,51 @@ export async function writeToRepo(
   }
   if (base.head.hash && cur.head.hash !== base.head.hash) await write('ORIG_HEAD', enc.encode(`${base.head.hash}\n`))
   for (const u of updates) {
+    if (!u.new) {
+      await deleteRef(repo, u.name)
+      continue
+    }
     await write(u.name, enc.encode(`${u.new}\n`))
     await log(`logs/${u.name}`, u)
     if (u.name !== 'HEAD' && u.name === base.head.ref) await log('logs/HEAD', u)
   }
   for (const o of objects) repo.mem.delete(o.hash)
-  for (const u of updates) if (u.name !== 'HEAD') repo.refs.set(u.name, u.new)
+  for (const u of updates) {
+    if (u.name === 'HEAD') continue
+    if (u.new) repo.refs.set(u.name, u.new)
+    else repo.refs.delete(u.name)
+  }
   repo.head = { ...cur.head }
   return updates
 }
+
+// A ref may be a loose file, a line in packed-refs (with a ^peeled line after it), or both.
+async function deleteRef(repo: Repo, name: string) {
+  const fs = repo.fs
+  await fs.remove!(name)
+  await fs.remove!(`logs/${name}`)
+  const packed = await fs.file('packed-refs')
+  if (!packed) return
+  const lines = (await packed.text()).split('\n')
+  const at = lines.findIndex((l) => l.endsWith(` ${name}`) && !l.startsWith('#'))
+  if (at < 0) return
+  lines.splice(at, lines[at + 1]?.startsWith('^') ? 2 : 1)
+  await fs.write!('packed-refs', enc.encode(lines.join('\n')))
+}
+
+// Files that change in the repo's checked-out commit: the repo's index and working tree still have
+// the old versions after writing, so `git status` would show the edits reversed until these are
+// restored.
+export async function staleFiles(repo: Repo, base: RefState, cur: RefState): Promise<string[]> {
+  const from = base.head.hash
+  const to = cur.head.ref ? cur.refs.get(cur.head.ref) : cur.head.hash
+  if (!from || !to || from === to) return []
+  const [a, b] = await Promise.all([repo.commit(from), repo.commit(to)])
+  return (await diffTrees(repo, a.tree, b.tree)).map((c) => binToText(c.path))
+}
+
+const shellQuote = (s: string) => (/^[\w./@%+=:,-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
+export const restoreCommand = (paths: string[]) => `git restore --source=HEAD --staged --worktree -- ${paths.map(shellQuote).join(' ')}`
 
 // ---------- bundle: for browsers that can't write to the folder ----------
 async function pack(algo: HashAlgo, objects: NewObject[]): Promise<Uint8Array> {
@@ -126,23 +170,30 @@ async function pack(algo: HashAlgo, objects: NewObject[]): Promise<Uint8Array> {
 // update-ref, which refuses if a ref is no longer at its old value and writes the reflog.
 export async function makeBundle(repo: Repo, base: RefState, cur: RefState, fileName: string, note: string) {
   const updates = refUpdates(base, cur)
+  const moved = updates.filter((u) => u.new)
   const prereqs = new Set<string>()
-  for (const u of updates) {
+  for (const u of moved) {
     if (!u.old) continue
     const p = await repo.peel(u.old)
     if (p.type === 'commit') prereqs.add(p.hash)
   }
+  const objects = await newObjects(repo, updates)
   const header =
     (repo.algo === 'sha256' ? '# v3 git bundle\n@object-format=sha256\n' : '# v2 git bundle\n') +
     [...prereqs].map((h) => `-${h}\n`).join('') +
-    updates.map((u) => `${u.new} ${u.name}\n`).join('') +
+    moved.map((u) => `${u.new} ${u.name}\n`).join('') +
     '\n'
-  const data = concat([enc.encode(header), await pack(repo.algo, await newObjects(repo, updates))])
+  // Only deleting refs: nothing to carry over, just the commands.
+  const data = moved.length ? concat([enc.encode(header), await pack(repo.algo, objects)]) : null
   const commands = [
-    `git bundle unbundle ${fileName}`,
-    ...updates.map(
-      (u) => `git update-ref -m "giteditor: ${note}"${u.name === 'HEAD' ? ' --no-deref' : ''} ${u.name} ${u.new} ${u.old ?? ''}`.trimEnd(),
+    ...(data ? [`git bundle unbundle ${fileName}`] : []),
+    ...updates.map((u) =>
+      u.new
+        ? `git update-ref -m "giteditor: ${note}"${u.name === 'HEAD' ? ' --no-deref' : ''} ${u.name} ${u.new} ${u.old ?? ''}`.trimEnd()
+        : `git update-ref -d ${u.name} ${u.old}`,
     ),
   ]
+  const stale = await staleFiles(repo, base, cur)
+  if (stale.length) commands.push(restoreCommand(stale))
   return { data, commands }
 }

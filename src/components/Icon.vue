@@ -31,6 +31,10 @@ const PATHS = {
   alert: 'M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z',
   repo: 'M5 4a1 1 0 011-1h13v15H6a1 1 0 00-1 1zM5 19a2 2 0 002 2h12v-3M9 7h6',
   check: 'M5 12l5 5 9-11',
+  terminal: 'M4 5h16v14H4zM7.5 9.5l3 2.5-3 2.5M12.5 15h4',
+  trash: 'M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 002 2h6a2 2 0 002-2l1-12M9 7V4h6v3',
+  pencil: 'M4 20h4L19 9l-4-4L4 16zM13.5 6.5l4 4',
+  plus: 'M12 5v14M5 12h14',
 }
 export type IconName = keyof typeof PATHS
 </script>

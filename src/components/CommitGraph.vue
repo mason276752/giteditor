@@ -7,10 +7,12 @@ import Icon, { type IconName } from './Icon.vue'
 const props = defineProps<{
   history: History
   selected: string | null
-  changed: (hash: string) => boolean
+  mark: (hash: string) => '' | 'M' | '+' // rewritten or brand new, not written yet
   hasRemotes: boolean
+  scanning: boolean
 }>()
 const remotes = defineModel<boolean>('remotes', { required: true })
+const dangling = defineModel<boolean>('dangling', { required: true })
 const emit = defineEmits<{ select: [hash: string] }>()
 
 const ROW = 30
@@ -48,7 +50,7 @@ function paths(row: Row) {
   return out
 }
 
-const LABEL_ICON: Record<RefLabel['kind'], IconName> = { head: 'commit', branch: 'branch', remote: 'branch', tag: 'tag' }
+const LABEL_ICON: Record<RefLabel['kind'], IconName> = { head: 'commit', branch: 'branch', remote: 'branch', tag: 'tag', dangling: 'alert' }
 const subject = (hash: string) => props.history.commits.get(hash)!.message.split('\n', 1)[0]
 
 function onScroll() {
@@ -114,12 +116,15 @@ onBeforeUnmount(() => ro?.disconnect())
       <label v-if="hasRemotes" class="check small" title="遠端分支指向的是遠端那邊的歷史；改寫之後，舊的 commit 會因為它們繼續顯示">
         <input v-model="remotes" type="checkbox" />遠端分支
       </label>
+      <label class="check small" title="也畫出沒有任何分支、標籤指著的 commit（例如 amend、rebase 之前的版本）">
+        <input v-model="dangling" type="checkbox" />dangling<span v-if="scanning" class="spinner" aria-hidden="true"></span>
+      </label>
       <span class="muted small count">{{ history.rows.length.toLocaleString() }} 個 commit</span>
     </div>
     <div ref="scroller" class="graph-scroll" @scroll="onScroll">
       <div class="graph-body" :style="{ height: `${history.rows.length * ROW}px` }">
         <button v-for="{ row, i } in visible" :key="row.hash" type="button" class="crow"
-                :class="{ active: row.hash === selected, changed: changed(row.hash) }"
+                :class="{ active: row.hash === selected, changed: !!mark(row.hash) }"
                 :style="{ transform: `translateY(${i * ROW}px)` }" @click="emit('select', row.hash)">
           <svg class="lanes" :width="graphWidth" :height="ROW" aria-hidden="true">
             <path v-for="(p, k) in paths(row)" :key="k" :d="p.d" :class="`g${p.c}`" />
@@ -133,7 +138,7 @@ onBeforeUnmount(() => ro?.disconnect())
             </span>
             <span class="msg">{{ subject(row.hash) }}</span>
           </span>
-          <span v-if="changed(row.hash)" class="mark" title="改寫過（還沒寫入）">M</span>
+          <span v-if="mark(row.hash)" class="mark" :title="mark(row.hash) === 'M' ? '改寫過（還沒寫入）' : '新的 commit（還沒寫入）'">{{ mark(row.hash) }}</span>
           <Icon v-if="history.commits.get(row.hash)!.sig" name="shield" class="signed" />
           <span class="who">{{ history.commits.get(row.hash)!.author.name }}</span>
           <span class="when">{{ fmtTime(history.commits.get(row.hash)!.author.time, history.commits.get(row.hash)!.author.tz) }}</span>
@@ -176,6 +181,7 @@ onBeforeUnmount(() => ro?.disconnect())
 .ref-branch.current { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .ref-remote { color: var(--muted); }
 .ref-tag { border-color: color-mix(in srgb, var(--folder) 55%, var(--line)); color: var(--folder); }
+.ref-dangling { border-style: dashed; color: var(--warn); }
 .ref-head { background: var(--text); border-color: var(--text); color: var(--bg); font-weight: 600; }
 .mark { flex: none; color: var(--warn); font-size: 12px; font-weight: 700; }
 .signed { flex: none; width: 14px; height: 14px; color: var(--accent); }

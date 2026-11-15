@@ -1,8 +1,9 @@
-import { fromBin } from './bytes'
+import { binToText, fromBin } from './bytes'
 import type { History, RefState } from './history'
 import { commitPayload, insertCommitSig, tagPayload, type CommitEdit } from './objects'
 import type { Repo } from './repo'
 import type { Signer } from './sign/signer'
+import { entryAt, mergeTrees, updateTree, type Entry } from './tree'
 
 // What happens to the signatures of commits rewritten only because a parent got a new hash
 // (their old signatures no longer match): dropped, redone with the key where there was one, or
@@ -12,6 +13,7 @@ export type DescendantSigs = 'drop' | 'resign' | 'all'
 export interface RewriteRequest {
   target: string
   edit: CommitEdit
+  files?: Map<string, Uint8Array> // new contents for files of the target (binary-string paths)
   sign: boolean // sign the edited commit
   descendants: DescendantSigs
   signer: Signer | null
@@ -23,8 +25,9 @@ export interface RewriteRequest {
 export const movable = (name: string, moveTags: boolean) =>
   name.startsWith('refs/heads/') || (moveTags && name.startsWith('refs/tags/'))
 
-function reachable(history: History, state: RefState, moveTags: boolean): Set<string> {
-  const tips = [...history.peeled].filter(([name]) => movable(name, moveTags) || name === 'HEAD').map(([, h]) => h)
+function reachable(history: History, moveTags: boolean): Set<string> {
+  // HEAD is the page's checkout when detached, REPO_HEAD the repo's own detached HEAD: both move too.
+  const tips = [...history.peeled].filter(([name]) => movable(name, moveTags) || name === 'HEAD' || name === 'REPO_HEAD').map(([, h]) => h)
   const seen = new Set<string>()
   while (tips.length) {
     const h = tips.pop()!
@@ -34,13 +37,12 @@ function reachable(history: History, state: RefState, moveTags: boolean): Set<st
     seen.add(h)
     tips.push(...c.parents)
   }
-  if (state.head.hash && !state.head.ref) seen.add(state.head.hash)
   return seen
 }
 
 // The target and every descendant a movable ref can reach, parents before children.
-export function affected(history: History, state: RefState, target: string, moveTags: boolean): string[] {
-  const reach = reachable(history, state, moveTags)
+export function affected(history: History, target: string, moveTags: boolean): string[] {
+  const reach = reachable(history, moveTags)
   if (!reach.has(target)) return []
   const set = new Set([target])
   const stack = [target]
@@ -64,7 +66,7 @@ export async function rewrite(
   req: RewriteRequest,
   onProgress?: (done: number, total: number) => void,
 ): Promise<{ state: RefState; map: Map<string, string> }> {
-  const order = affected(history, state, req.target, req.moveTags)
+  const order = affected(history, req.target, req.moveTags)
   if (!order.length) throw new Error('沒有本地分支包含這個 commit，改了也不會有分支指向它。')
   const sigHeader = repo.algo === 'sha256' ? 'gpgsig-sha256' : 'gpgsig'
   const signs = (wasSigned: boolean) => req.descendants === 'all' || (req.descendants === 'resign' && wasSigned)
@@ -73,11 +75,35 @@ export async function rewrite(
     return req.signer
   }
 
+  // Edited files: the target gets them, and each later commit gets the same change merged in, the way
+  // a rebase would carry it.
+  const target = history.commits.get(req.target)!
+  let newTree: string | null = null
+  if (req.files?.size) {
+    const changes = new Map<string, Entry>()
+    for (const [path, data] of req.files) {
+      const old = await entryAt(repo, target.tree, path)
+      changes.set(path, { mode: old?.mode ?? '100644', hash: await repo.add('blob', data) })
+    }
+    newTree = await updateTree(repo, target.tree, changes)
+  }
+
   const map = new Map<string, string>()
   for (const [i, hash] of order.entries()) {
     const c = history.commits.get(hash)!
     const isTarget = hash === req.target
-    let payload = commitPayload(c, c.parents.map((p) => map.get(p) ?? p), isTarget ? req.edit : {})
+    let tree: string | undefined
+    if (newTree && isTarget) tree = newTree
+    else if (newTree) {
+      const merged = await mergeTrees(repo, target.tree, c.tree, newTree)
+      if (merged.conflicts.length) {
+        throw new Error(
+          `後面的 commit ${hash.slice(0, 7)}「${c.message.split('\n', 1)[0]}」也改了 ${merged.conflicts.map((p) => binToText(p)).join('、')} 的同一段，沒辦法自動帶過去，所以什麼都沒改。`,
+        )
+      }
+      tree = merged.tree
+    }
+    let payload = commitPayload(c, c.parents.map((p) => map.get(p) ?? p), isTarget ? { ...req.edit, tree } : { tree })
     if (isTarget ? req.sign : signs(!!c.sig) && req.signer) {
       payload = insertCommitSig(payload, sigHeader, await signer().sign(fromBin(payload)))
     }
